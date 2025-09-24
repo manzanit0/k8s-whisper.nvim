@@ -127,7 +127,7 @@ M.match_crd = function(buffer_content)
 end
 
 -- Attach a schema to the buffer
-M.attach_schema = function(schema_url, description)
+M.attach_schema = function(schema_url, description, buffer_path)
   local clients = vim.lsp.get_clients({ name = 'yamlls' })
   if #clients == 0 then
     vim.notify('yaml-language-server is not active.', vim.log.levels.WARN)
@@ -141,7 +141,7 @@ M.attach_schema = function(schema_url, description)
   yaml_client.config.settings.yaml.schemas = yaml_client.config.settings.yaml.schemas or {}
 
   -- Attach the schema only for the current buffer
-  yaml_client.config.settings.yaml.schemas[schema_url] = '*.yaml'
+  yaml_client.config.settings.yaml.schemas[schema_url] = buffer_path
 
   -- Notify the server of the configuration change
   yaml_client.notify('workspace/didChangeConfiguration', {
@@ -185,6 +185,7 @@ M.init = function(bufnr)
   if vim.b[bufnr].schema_attached then
     return
   end
+  local buffer_path = vim.api.nvim_buf_get_name(bufnr)
   vim.b[bufnr].schema_attached = true -- Mark the schema as attached
 
   local buffer_content = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
@@ -194,7 +195,7 @@ M.init = function(bufnr)
     -- Attach schemas for all matched CRDs
     for _, match in ipairs(matched_crds) do
       local schema_url = M.schema_url .. '/' .. match.crd
-      M.attach_schema(schema_url, 'CRD schema for ' .. match.resource.kind)
+      M.attach_schema(schema_url, 'CRD schema for ' .. match.resource.kind, buffer_path)
     end
   else
     -- Check if the file contains Kubernetes YAML resources
@@ -205,7 +206,7 @@ M.init = function(bufnr)
         -- Attach the Kubernetes schema
         local kubernetes_schema_url = M.get_kubernetes_schema_url(resource.api_version, resource.kind)
         if kubernetes_schema_url then
-          M.attach_schema(kubernetes_schema_url, 'Kubernetes schema for ' .. resource.kind)
+          M.attach_schema(kubernetes_schema_url, 'Kubernetes schema for ' .. resource.kind, buffer_path)
           attached_any = true
         end
       end
