@@ -31,4 +31,4 @@ Install the plugin with your package manager:
 
 ## Credit
 
-https://www.reddit.com/r/neovim/comments/1iykmqc/improving_kubernetes_yaml_support_in_neovim_crds/
+Based on: https://www.reddit.com/r/neovim/comments/1iykmqc/improving_kubernetes_yaml_support_in_neovim_crds/

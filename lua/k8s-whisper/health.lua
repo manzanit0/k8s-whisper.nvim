@@ -7,7 +7,7 @@ M.check = function()
   -- Get configuration from the main whisper module
   local whisper = require('k8s-whisper')
   local config = whisper.config
-  
+
   -- Test schema catalog connectivity
   local url = config.github_base_api_url .. '/' .. config.schemas_catalog .. '/git/trees/' .. config.schema_catalog_ref
 
@@ -28,4 +28,3 @@ M.check = function()
 end
 
 return M
-
