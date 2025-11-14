@@ -9,6 +9,7 @@ local default_config = {
     Accept = 'application/vnd.github+json',
     ['X-GitHub-Api-Version'] = '2022-11-28',
   },
+  auto_insert_modeline = true, -- Automatically insert schema modeline comments
 }
 
 local M = {
@@ -16,6 +17,7 @@ local M = {
   schema_cache = {}, -- Cache for downloaded schemas
   refresh_timers = {}, -- Timers for debouncing refresh per buffer
   current_schemas = {}, -- Track currently attached schemas per buffer
+  inserting_modelines = {}, -- Track when we're inserting modelines to prevent refresh loops
 }
 
 -- Setup function to configure the plugin
@@ -48,40 +50,60 @@ M.list_github_tree = function()
 end
 
 -- Extract apiVersion and kind from YAML content, handling multiple resources
+-- Returns array of resources with line numbers
 M.extract_api_version_and_kind = function(buffer_content)
-  -- Split the content by document separators (---)
-  local documents = {}
-  local current_doc = ""
-
-  for line in buffer_content:gmatch("[^\n]*") do
-    if line:match("^%-%-%-%s*$") then
-      if current_doc:match("%S") then -- Only add non-empty documents
-        table.insert(documents, current_doc)
-      end
-      current_doc = ""
-    else
-      current_doc = current_doc .. line .. "\n"
-    end
-  end
-
-  -- Add the last document if it exists
-  if current_doc:match("%S") then
-    table.insert(documents, current_doc)
-  end
-
-  -- If no documents were found, treat the entire content as one document
-  if #documents == 0 then
-    documents = { buffer_content }
-  end
-
-  -- Extract apiVersion and kind from each document
   local resources = {}
-  for _, doc in ipairs(documents) do
-    local api_version = doc:match('apiVersion:%s*([%w%.%/%-]+)')
-    local kind = doc:match('kind:%s*([%w%-]+)')
-    if api_version and kind then
-      table.insert(resources, { api_version = api_version, kind = kind })
+  local lines = vim.split(buffer_content, '\n', { plain = true })
+
+  local current_doc_start = 1
+  local current_api_version = nil
+  local current_kind = nil
+  local has_content = false
+
+  for line_num, line in ipairs(lines) do
+    -- Check for document separator
+    if line:match("^%-%-%-%s*$") then
+      -- Save previous document if it had content
+      if has_content and current_api_version and current_kind then
+        table.insert(resources, {
+          api_version = current_api_version,
+          kind = current_kind,
+          start_line = current_doc_start,
+        })
+      end
+      -- Start new document
+      current_doc_start = line_num + 1
+      current_api_version = nil
+      current_kind = nil
+      has_content = false
+    else
+      -- Check for apiVersion and kind
+      if not current_api_version then
+        local api_version = line:match('apiVersion:%s*([%w%.%/%-]+)')
+        if api_version then
+          current_api_version = api_version
+        end
+      end
+      if not current_kind then
+        local kind = line:match('kind:%s*([%w%-]+)')
+        if kind then
+          current_kind = kind
+        end
+      end
+      -- Check if line has content
+      if line:match("%S") then
+        has_content = true
+      end
     end
+  end
+
+  -- Don't forget the last document
+  if has_content and current_api_version and current_kind then
+    table.insert(resources, {
+      api_version = current_api_version,
+      kind = current_kind,
+      start_line = current_doc_start,
+    })
   end
 
   return resources
@@ -164,8 +186,12 @@ M.clear_schemas = function(bufnr)
   end
 end
 
--- Attach a schema to the buffer
-M.attach_schema = function(bufnr, schema_url, description)
+-- Attach multiple schemas to a buffer at once
+M.attach_schemas = function(bufnr, schemas)
+  if not schemas or #schemas == 0 then
+    return
+  end
+
   local clients = vim.lsp.get_clients({ name = 'yamlls' })
   if #clients == 0 then
     vim.notify('yaml-language-server is not active.', vim.log.levels.WARN)
@@ -184,18 +210,27 @@ M.attach_schema = function(bufnr, schema_url, description)
   yaml_client.config.settings.yaml = yaml_client.config.settings.yaml or {}
   yaml_client.config.settings.yaml.schemas = yaml_client.config.settings.yaml.schemas or {}
 
-  -- Attach the schema only for this specific buffer using its file path
-  yaml_client.config.settings.yaml.schemas[schema_url] = bufname
-
-  -- Track the attached schema for this buffer
+  -- Attach all schemas for this specific buffer
   M.current_schemas[bufnr] = M.current_schemas[bufnr] or {}
-  M.current_schemas[bufnr][schema_url] = true
+  local descriptions = {}
+
+  for _, schema in ipairs(schemas) do
+    yaml_client.config.settings.yaml.schemas[schema.url] = bufname
+    M.current_schemas[bufnr][schema.url] = true
+    table.insert(descriptions, schema.description)
+  end
 
   -- Notify the server of the configuration change
   yaml_client.notify('workspace/didChangeConfiguration', {
     settings = yaml_client.config.settings,
   })
-  vim.notify('Attached schema: ' .. description, vim.log.levels.INFO)
+
+  -- Show a single notification with all attached schemas
+  if #descriptions == 1 then
+    vim.notify('Attached schema: ' .. descriptions[1], vim.log.levels.INFO)
+  else
+    vim.notify('Attached ' .. #descriptions .. ' schemas: ' .. table.concat(descriptions, ', '), vim.log.levels.INFO)
+  end
 end
 
 -- Get the correct Kubernetes schema URL based on apiVersion and kind
@@ -228,38 +263,127 @@ M.get_kubernetes_schema_url = function(api_version, kind)
   return nil
 end
 
+-- Insert schema modeline comments for each document in the buffer
+M.insert_schema_modelines = function(bufnr, resource_schemas)
+  if not M.config.auto_insert_modeline or #resource_schemas == 0 then
+    return
+  end
+
+  -- Set flag to prevent refresh loop
+  M.inserting_modelines[bufnr] = true
+
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local modeline_pattern = '^#%s*yaml%-language%-server:%s*%$schema='
+
+  -- Process documents in reverse order to maintain line numbers
+  for i = #resource_schemas, 1, -1 do
+    local resource_schema = resource_schemas[i]
+    local start_line = resource_schema.start_line - 1 -- Convert to 0-indexed
+
+    -- Check if modeline already exists at the start of this document
+    local has_modeline = false
+    if start_line < #lines then
+      local line = lines[start_line + 1]
+      if line and line:match(modeline_pattern) then
+        has_modeline = true
+        -- Update existing modeline
+        vim.api.nvim_buf_set_lines(bufnr, start_line, start_line + 1, false, {
+          '# yaml-language-server: $schema=' .. resource_schema.schema_url
+        })
+      end
+    end
+
+    -- Insert new modeline if it doesn't exist
+    if not has_modeline then
+      vim.api.nvim_buf_set_lines(bufnr, start_line, start_line, false, {
+        '# yaml-language-server: $schema=' .. resource_schema.schema_url
+      })
+    end
+  end
+
+  -- Clear flag after a short delay to allow the change to propagate
+  vim.defer_fn(function()
+    M.inserting_modelines[bufnr] = nil
+  end, 100)
+end
+
 -- Refresh schemas for a buffer (called on buffer changes)
 M.refresh_schemas = function(bufnr)
-  -- Clear old schemas first
-  M.clear_schemas(bufnr)
-
   local buffer_content = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
-  local matched_crds = M.match_crd(buffer_content)
+  local resource_schemas = {}
 
-  if matched_crds and #matched_crds > 0 then
-    -- Attach schemas for all matched CRDs
-    for _, match in ipairs(matched_crds) do
-      local schema_url = M.schema_url .. '/' .. match.crd
-      M.attach_schema(bufnr, schema_url, 'CRD schema for ' .. match.resource.kind)
-    end
-  else
-    -- Check if the file contains Kubernetes YAML resources
-    local resources = M.extract_api_version_and_kind(buffer_content)
-    if resources and #resources > 0 then
-      for _, resource in ipairs(resources) do
-        -- Attach the Kubernetes schema
-        local kubernetes_schema_url = M.get_kubernetes_schema_url(resource.api_version, resource.kind)
-        if kubernetes_schema_url then
-          M.attach_schema(bufnr, kubernetes_schema_url, 'Kubernetes schema for ' .. resource.kind)
+  -- Extract all resources with their line numbers
+  local resources = M.extract_api_version_and_kind(buffer_content)
+  if not resources or #resources == 0 then
+    vim.notify('No Kubernetes resources found in this file', vim.log.levels.WARN)
+    return
+  end
+
+  local all_crds = M.list_github_tree()
+
+  -- Match each resource to its schema
+  for _, resource in ipairs(resources) do
+    local schema_url = nil
+    local description = nil
+
+    -- First, try to match as a CRD
+    local crd_name = M.normalize_crd_name(resource.api_version, resource.kind)
+    if crd_name then
+      for _, crd in ipairs(all_crds) do
+        if crd:match(crd_name) then
+          schema_url = M.schema_url .. '/' .. crd
+          description = resource.kind .. ' (' .. resource.api_version .. ')'
+          break
         end
       end
     end
+
+    -- If not a CRD, try to match as a standard Kubernetes resource
+    if not schema_url then
+      local kubernetes_schema_url = M.get_kubernetes_schema_url(resource.api_version, resource.kind)
+      if kubernetes_schema_url then
+        schema_url = kubernetes_schema_url
+        description = resource.kind .. ' (' .. resource.api_version .. ')'
+      end
+    end
+
+    -- Add to resource_schemas if we found a schema
+    if schema_url then
+      table.insert(resource_schemas, {
+        start_line = resource.start_line,
+        schema_url = schema_url,
+        description = description,
+      })
+    end
+  end
+
+  -- Insert modeline comments for each document
+  if #resource_schemas > 0 then
+    M.insert_schema_modelines(bufnr, resource_schemas)
+
+    -- Show notification about attached schemas
+    local descriptions = {}
+    for _, rs in ipairs(resource_schemas) do
+      table.insert(descriptions, rs.description)
+    end
+    if #descriptions == 1 then
+      vim.notify('Attached schema: ' .. descriptions[1], vim.log.levels.INFO)
+    else
+      vim.notify('Attached ' .. #descriptions .. ' schemas: ' .. table.concat(descriptions, ', '), vim.log.levels.INFO)
+    end
+  else
+    vim.notify('No schemas found for any resources in this file', vim.log.levels.WARN)
   end
 end
 
 -- Debounced refresh function
 M.debounced_refresh = function(bufnr, delay)
   delay = delay or 1000 -- Default 1 second delay
+
+  -- Don't refresh if we're currently inserting modelines
+  if M.inserting_modelines[bufnr] then
+    return
+  end
 
   -- Cancel existing timer for this buffer
   if M.refresh_timers[bufnr] then
@@ -268,7 +392,10 @@ M.debounced_refresh = function(bufnr, delay)
 
   -- Create a new timer
   M.refresh_timers[bufnr] = vim.fn.timer_start(delay, function()
-    M.refresh_schemas(bufnr)
+    -- Double-check we're not inserting modelines
+    if not M.inserting_modelines[bufnr] then
+      M.refresh_schemas(bufnr)
+    end
     M.refresh_timers[bufnr] = nil
   end)
 end
@@ -303,6 +430,7 @@ M.init = function(bufnr)
         vim.fn.timer_stop(M.refresh_timers[bufnr])
         M.refresh_timers[bufnr] = nil
       end
+      M.inserting_modelines[bufnr] = nil
     end,
   })
 end
