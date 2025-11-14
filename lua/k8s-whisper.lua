@@ -136,15 +136,29 @@ M.clear_schemas = function(bufnr)
   end
   local yaml_client = clients[1]
 
+  -- Get the buffer's file path
+  local bufname = vim.api.nvim_buf_get_name(bufnr)
+  if bufname == '' then
+    return
+  end
+
   -- Clear the schemas for this buffer
   if M.current_schemas[bufnr] then
     yaml_client.config.settings = yaml_client.config.settings or {}
     yaml_client.config.settings.yaml = yaml_client.config.settings.yaml or {}
     yaml_client.config.settings.yaml.schemas = yaml_client.config.settings.yaml.schemas or {}
 
+    -- Only remove schema entries that point to this specific buffer's file
     for schema_url, _ in pairs(M.current_schemas[bufnr]) do
-      yaml_client.config.settings.yaml.schemas[schema_url] = nil
+      if yaml_client.config.settings.yaml.schemas[schema_url] == bufname then
+        yaml_client.config.settings.yaml.schemas[schema_url] = nil
+      end
     end
+
+    -- Notify the server of the configuration change
+    yaml_client.notify('workspace/didChangeConfiguration', {
+      settings = yaml_client.config.settings,
+    })
 
     M.current_schemas[bufnr] = nil
   end
@@ -159,13 +173,19 @@ M.attach_schema = function(bufnr, schema_url, description)
   end
   local yaml_client = clients[1]
 
+  -- Get the buffer's file path
+  local bufname = vim.api.nvim_buf_get_name(bufnr)
+  if bufname == '' then
+    return -- Skip buffers without a name
+  end
+
   -- Update the yaml.schemas setting for the current buffer
   yaml_client.config.settings = yaml_client.config.settings or {}
   yaml_client.config.settings.yaml = yaml_client.config.settings.yaml or {}
   yaml_client.config.settings.yaml.schemas = yaml_client.config.settings.yaml.schemas or {}
 
-  -- Attach the schema only for the current buffer
-  yaml_client.config.settings.yaml.schemas[schema_url] = '*.yaml'
+  -- Attach the schema only for this specific buffer using its file path
+  yaml_client.config.settings.yaml.schemas[schema_url] = bufname
 
   -- Track the attached schema for this buffer
   M.current_schemas[bufnr] = M.current_schemas[bufnr] or {}
