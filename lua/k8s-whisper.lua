@@ -14,6 +14,8 @@ local default_config = {
 local M = {
   config = vim.deepcopy(default_config),
   schema_cache = {}, -- Cache for downloaded schemas
+  refresh_timers = {}, -- Timers for debouncing refresh per buffer
+  current_schemas = {}, -- Track currently attached schemas per buffer
 }
 
 -- Setup function to configure the plugin
@@ -126,8 +128,30 @@ M.match_crd = function(buffer_content)
   return matched_crds
 end
 
+-- Clear all schemas for the current buffer
+M.clear_schemas = function(bufnr)
+  local clients = vim.lsp.get_clients({ name = 'yamlls' })
+  if #clients == 0 then
+    return
+  end
+  local yaml_client = clients[1]
+
+  -- Clear the schemas for this buffer
+  if M.current_schemas[bufnr] then
+    yaml_client.config.settings = yaml_client.config.settings or {}
+    yaml_client.config.settings.yaml = yaml_client.config.settings.yaml or {}
+    yaml_client.config.settings.yaml.schemas = yaml_client.config.settings.yaml.schemas or {}
+
+    for schema_url, _ in pairs(M.current_schemas[bufnr]) do
+      yaml_client.config.settings.yaml.schemas[schema_url] = nil
+    end
+
+    M.current_schemas[bufnr] = nil
+  end
+end
+
 -- Attach a schema to the buffer
-M.attach_schema = function(schema_url, description)
+M.attach_schema = function(bufnr, schema_url, description)
   local clients = vim.lsp.get_clients({ name = 'yamlls' })
   if #clients == 0 then
     vim.notify('yaml-language-server is not active.', vim.log.levels.WARN)
@@ -142,6 +166,10 @@ M.attach_schema = function(schema_url, description)
 
   -- Attach the schema only for the current buffer
   yaml_client.config.settings.yaml.schemas[schema_url] = '*.yaml'
+
+  -- Track the attached schema for this buffer
+  M.current_schemas[bufnr] = M.current_schemas[bufnr] or {}
+  M.current_schemas[bufnr][schema_url] = true
 
   -- Notify the server of the configuration change
   yaml_client.notify('workspace/didChangeConfiguration', {
@@ -180,12 +208,10 @@ M.get_kubernetes_schema_url = function(api_version, kind)
   return nil
 end
 
-M.init = function(bufnr)
-  -- Check if the schema has already been attached to this buffer
-  if vim.b[bufnr].schema_attached then
-    return
-  end
-  vim.b[bufnr].schema_attached = true -- Mark the schema as attached
+-- Refresh schemas for a buffer (called on buffer changes)
+M.refresh_schemas = function(bufnr)
+  -- Clear old schemas first
+  M.clear_schemas(bufnr)
 
   local buffer_content = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
   local matched_crds = M.match_crd(buffer_content)
@@ -194,30 +220,71 @@ M.init = function(bufnr)
     -- Attach schemas for all matched CRDs
     for _, match in ipairs(matched_crds) do
       local schema_url = M.schema_url .. '/' .. match.crd
-      M.attach_schema(schema_url, 'CRD schema for ' .. match.resource.kind)
+      M.attach_schema(bufnr, schema_url, 'CRD schema for ' .. match.resource.kind)
     end
   else
     -- Check if the file contains Kubernetes YAML resources
     local resources = M.extract_api_version_and_kind(buffer_content)
     if resources and #resources > 0 then
-      local attached_any = false
       for _, resource in ipairs(resources) do
         -- Attach the Kubernetes schema
         local kubernetes_schema_url = M.get_kubernetes_schema_url(resource.api_version, resource.kind)
         if kubernetes_schema_url then
-          M.attach_schema(kubernetes_schema_url, 'Kubernetes schema for ' .. resource.kind)
-          attached_any = true
+          M.attach_schema(bufnr, kubernetes_schema_url, 'Kubernetes schema for ' .. resource.kind)
         end
       end
-
-      if not attached_any then
-        vim.notify('No Kubernetes schemas found for any resources in this file', vim.log.levels.WARN)
-      end
-    else
-      -- Fall back to the default LSP configuration
-      vim.notify('No CRD or Kubernetes schema found. Falling back to default LSP configuration.', vim.log.levels.WARN)
     end
   end
+end
+
+-- Debounced refresh function
+M.debounced_refresh = function(bufnr, delay)
+  delay = delay or 1000 -- Default 1 second delay
+
+  -- Cancel existing timer for this buffer
+  if M.refresh_timers[bufnr] then
+    vim.fn.timer_stop(M.refresh_timers[bufnr])
+  end
+
+  -- Create a new timer
+  M.refresh_timers[bufnr] = vim.fn.timer_start(delay, function()
+    M.refresh_schemas(bufnr)
+    M.refresh_timers[bufnr] = nil
+  end)
+end
+
+M.init = function(bufnr)
+  -- Check if the schema has already been attached to this buffer
+  if vim.b[bufnr].schema_attached then
+    return
+  end
+  vim.b[bufnr].schema_attached = true -- Mark the schema as attached
+
+  -- Initial schema attachment
+  M.refresh_schemas(bufnr)
+
+  -- Set up autocmds to refresh on buffer changes
+  local augroup = vim.api.nvim_create_augroup('K8sWhisperRefresh_' .. bufnr, { clear = true })
+  vim.api.nvim_create_autocmd({ 'TextChanged', 'TextChangedI' }, {
+    group = augroup,
+    buffer = bufnr,
+    callback = function()
+      M.debounced_refresh(bufnr)
+    end,
+  })
+
+  -- Clean up when buffer is deleted
+  vim.api.nvim_create_autocmd('BufDelete', {
+    group = augroup,
+    buffer = bufnr,
+    callback = function()
+      M.clear_schemas(bufnr)
+      if M.refresh_timers[bufnr] then
+        vim.fn.timer_stop(M.refresh_timers[bufnr])
+        M.refresh_timers[bufnr] = nil
+      end
+    end,
+  })
 end
 
 return M
