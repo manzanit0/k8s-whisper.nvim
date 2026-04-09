@@ -391,22 +391,8 @@ M.refresh_schemas = function(bufnr)
     end
   end
 
-  -- Set diagnostics for resources with no schema found
-  if #unmatched > 0 then
-    local diagnostics = {}
-    for _, resource in ipairs(unmatched) do
-      table.insert(diagnostics, {
-        lnum = resource.start_line - 1,
-        col = 0,
-        severity = vim.diagnostic.severity.WARN,
-        message = 'No schema found for ' .. resource.kind .. ' (' .. resource.api_version .. ') — this resource is not validated',
-        source = 'k8s-whisper',
-      })
-    end
-    vim.diagnostic.set(ns, bufnr, diagnostics)
-  end
-
-  -- Insert modeline comments for each document
+  -- Insert modeline comments for matched resources first, then compute diagnostics
+  -- so line numbers account for the modelines that were inserted above each resource
   if #resource_schemas > 0 then
     M.insert_schema_modelines(bufnr, resource_schemas)
 
@@ -420,6 +406,29 @@ M.refresh_schemas = function(bufnr)
     else
       vim.notify('Attached ' .. #descriptions .. ' schemas: ' .. table.concat(descriptions, ', '), vim.log.levels.INFO)
     end
+  end
+
+  -- Set diagnostics for resources with no schema found.
+  -- Each matched resource whose start_line precedes this one caused a modeline insertion,
+  -- shifting the buffer down by one line — account for that in lnum.
+  if #unmatched > 0 then
+    local diagnostics = {}
+    for _, resource in ipairs(unmatched) do
+      local offset = 0
+      for _, rs in ipairs(resource_schemas) do
+        if rs.start_line < resource.start_line then
+          offset = offset + 1
+        end
+      end
+      table.insert(diagnostics, {
+        lnum = resource.start_line - 1 + offset,
+        col = 0,
+        severity = vim.diagnostic.severity.WARN,
+        message = 'No schema found for ' .. resource.kind .. ' (' .. resource.api_version .. ') — this resource is not validated',
+        source = 'k8s-whisper',
+      })
+    end
+    vim.diagnostic.set(ns, bufnr, diagnostics)
   end
 end
 
