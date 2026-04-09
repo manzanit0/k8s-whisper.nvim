@@ -20,6 +20,8 @@ local M = {
   inserting_modelines = {}, -- Track when we're inserting modelines to prevent refresh loops
 }
 
+local ns = vim.api.nvim_create_namespace('k8s-whisper')
+
 -- Setup function to configure the plugin
 M.setup = function(opts)
   opts = opts or {}
@@ -312,14 +314,17 @@ M.refresh_schemas = function(bufnr)
   local buffer_content = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
   local resource_schemas = {}
 
+  -- Clear previous diagnostics for this buffer
+  vim.diagnostic.reset(ns, bufnr)
+
   -- Extract all resources with their line numbers
   local resources = M.extract_api_version_and_kind(buffer_content)
   if not resources or #resources == 0 then
-    vim.notify('No Kubernetes resources found in this file', vim.log.levels.WARN)
     return
   end
 
   local all_crds = M.list_github_tree()
+  local unmatched = {}
 
   -- Match each resource to its schema
   for _, resource in ipairs(resources) do
@@ -330,9 +335,13 @@ M.refresh_schemas = function(bufnr)
     local crd_name = M.normalize_crd_name(resource.api_version, resource.kind)
     if crd_name then
       for _, crd in ipairs(all_crds) do
-        if crd:match(crd_name) then
-          schema_url = M.schema_url .. '/' .. crd
-          description = resource.kind .. ' (' .. resource.api_version .. ')'
+        if crd:find(crd_name, 1, true) then
+          local candidate_url = M.schema_url .. '/' .. crd
+          local response = curl.get(candidate_url, { headers = M.config.github_headers })
+          if response.status == 200 then
+            schema_url = candidate_url
+            description = resource.kind .. ' (' .. resource.api_version .. ')'
+          end
           break
         end
       end
@@ -347,14 +356,31 @@ M.refresh_schemas = function(bufnr)
       end
     end
 
-    -- Add to resource_schemas if we found a schema
+    -- Add to resource_schemas if we found a schema, otherwise track as unmatched
     if schema_url then
       table.insert(resource_schemas, {
         start_line = resource.start_line,
         schema_url = schema_url,
         description = description,
       })
+    else
+      table.insert(unmatched, resource)
     end
+  end
+
+  -- Set diagnostics for resources with no schema found
+  if #unmatched > 0 then
+    local diagnostics = {}
+    for _, resource in ipairs(unmatched) do
+      table.insert(diagnostics, {
+        lnum = resource.start_line - 1,
+        col = 0,
+        severity = vim.diagnostic.severity.WARN,
+        message = 'No schema found for ' .. resource.kind .. ' (' .. resource.api_version .. ') — this resource is not validated',
+        source = 'k8s-whisper',
+      })
+    end
+    vim.diagnostic.set(ns, bufnr, diagnostics)
   end
 
   -- Insert modeline comments for each document
@@ -371,8 +397,6 @@ M.refresh_schemas = function(bufnr)
     else
       vim.notify('Attached ' .. #descriptions .. ' schemas: ' .. table.concat(descriptions, ', '), vim.log.levels.INFO)
     end
-  else
-    vim.notify('No schemas found for any resources in this file', vim.log.levels.WARN)
   end
 end
 
@@ -426,6 +450,7 @@ M.init = function(bufnr)
     buffer = bufnr,
     callback = function()
       M.clear_schemas(bufnr)
+      vim.diagnostic.reset(ns, bufnr)
       if M.refresh_timers[bufnr] then
         vim.fn.timer_stop(M.refresh_timers[bufnr])
         M.refresh_timers[bufnr] = nil
