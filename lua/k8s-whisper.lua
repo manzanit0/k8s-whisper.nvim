@@ -309,8 +309,31 @@ M.insert_schema_modelines = function(bufnr, resource_schemas)
   end, 100)
 end
 
+-- Remove all yaml-language-server modelines from the buffer immediately
+M.clear_modelines = function(bufnr)
+  local modeline_pattern = '^#%s*yaml%-language%-server:%s*%$schema='
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local to_remove = {}
+  for i, line in ipairs(lines) do
+    if line:match(modeline_pattern) then
+      table.insert(to_remove, i - 1) -- collect 0-indexed line numbers
+    end
+  end
+  if #to_remove > 0 then
+    M.inserting_modelines[bufnr] = true
+    for i = #to_remove, 1, -1 do
+      vim.api.nvim_buf_set_lines(bufnr, to_remove[i], to_remove[i] + 1, false, {})
+    end
+    vim.defer_fn(function() M.inserting_modelines[bufnr] = nil end, 100)
+  end
+end
+
 -- Refresh schemas for a buffer (called on buffer changes)
 M.refresh_schemas = function(bufnr)
+  -- Strip all existing modelines immediately so yamlls does not try to load stale schema URLs
+  -- while the HTTP checks below are in progress
+  M.clear_modelines(bufnr)
+
   local buffer_content = table.concat(vim.api.nvim_buf_get_lines(bufnr, 0, -1, false), '\n')
   local resource_schemas = {}
 
@@ -368,19 +391,10 @@ M.refresh_schemas = function(bufnr)
     end
   end
 
-  -- Set diagnostics and remove stale modelines for resources with no schema found
+  -- Set diagnostics for resources with no schema found
   if #unmatched > 0 then
     local diagnostics = {}
-    local modeline_pattern = '^#%s*yaml%-language%-server:%s*%$schema='
-    local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
     for _, resource in ipairs(unmatched) do
-      -- Remove any existing modeline at this resource's start so yamlls stops trying to load it
-      local start_line = resource.start_line - 1 -- 0-indexed
-      if start_line < #lines and lines[start_line + 1] and lines[start_line + 1]:match(modeline_pattern) then
-        M.inserting_modelines[bufnr] = true
-        vim.api.nvim_buf_set_lines(bufnr, start_line, start_line + 1, false, {})
-        vim.defer_fn(function() M.inserting_modelines[bufnr] = nil end, 100)
-      end
       table.insert(diagnostics, {
         lnum = resource.start_line - 1,
         col = 0,
