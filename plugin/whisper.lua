@@ -1,4 +1,12 @@
 
+-- Strip stale modelines before the LSP attaches so yamlls never sees an invalid $schema URL
+vim.api.nvim_create_autocmd('BufReadPost', {
+  pattern = { '*.yaml', '*.yml' },
+  callback = function(args)
+    require('k8s-whisper').clear_modelines(args.buf)
+  end,
+})
+
 vim.api.nvim_create_autocmd('FileType', {
   pattern = 'yaml',
   callback = function(args)
